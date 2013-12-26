@@ -1,5 +1,7 @@
 // Run a simple TCP client/server and measures the latency in the
 // reply. This is basically as stripped down as you can get.
+//
+// This is benchmark code, not for production.
 #define _GNU_SOURCE             /* See feature_test_macros(7) */
 #include <assert.h>
 #include <errno.h>
@@ -23,14 +25,23 @@
 typedef struct {
   int mode; // 0 = server, 1 = client.
   int server_port;
+  int msg_size;
+  int interval_us;
+  int samples;
 } Options;
-Options g_options = { 0, 9999 };
+static Options g_options = { 0, 9999, 1, 1000, 10000 };
 
 typedef struct {
   int epoll_fd;
   int listen_fd;
 } ServerState;
-ServerState g_server = {};
+static ServerState g_server = {};
+
+typedef struct {
+  int64_t* rtt;
+  int rtt_size;
+} Stats;
+Stats g_stats = {};
 
 #define PCHECK(x)                                               \
   if ((x) < 0) {                                                \
@@ -43,6 +54,12 @@ ServerState g_server = {};
     abort();                                                    \
   }
 
+int int64_compare(const void* a, const void* b) {
+  int64_t av = *((const int64_t*) a);
+  int64_t bv = *((const int64_t*) b);
+  return av - bv;
+}
+
 int parse_command_line();
 void print_usage();
 int64_t now_in_usecs();
@@ -52,8 +69,29 @@ void run_client();
 int
 parse_command_line(int argc, char* argv[])
 {
-  if (argc > 1 && strcmp(argv[1], "-c") == 0) {
-    g_options.mode = 1;
+  int opt;
+  while ((opt = getopt(argc, argv, "hcp:m:i:")) != -1) {
+    switch (opt) {
+      case 'h':
+        print_usage();
+        return 0;
+        break;
+      case 'c':
+        g_options.mode = 1;
+        break;
+      case 'p':
+        g_options.server_port = atoi(optarg);
+        break;
+      case 'm':
+        g_options.msg_size = atoi(optarg);
+        break;
+      case 'i':
+        g_options.interval_us = atoi(optarg);
+        break;
+      default:
+        print_usage();
+        return 0;
+    }
   }
 
   return 1;
@@ -62,6 +100,7 @@ parse_command_line(int argc, char* argv[])
 void
 print_usage()
 {
+  // XXX
 }
 
 int64_t
@@ -106,6 +145,8 @@ run_server()
 
 #define MAX_EVENTS 100
   struct epoll_event active_events[MAX_EVENTS];
+#define MAX_BUF 10*1024*1024
+  char* buf = malloc(MAX_BUF);
 
   for (;;) {
     int num_events = epoll_wait(
@@ -132,12 +173,19 @@ run_server()
         ev.data.fd = sock;
         PCHECK(epoll_ctl(g_server.epoll_fd, EPOLL_CTL_ADD, sock, &ev));
       } else {
-        char c;
-        int cc = read(fd, &c, 1);
+        int cc;
+        int size;
+        PCHECK(cc = read(fd, &size, sizeof(size)));
+
         if (cc == 0) {
           PCHECK(close(fd));
         } else {
-          PCHECK(write(fd, &c, 1));
+          int bytes_read = 0;
+          while (bytes_read < size) {
+            PCHECK(cc = read(fd, buf, size - bytes_read));
+            bytes_read += cc;
+            PCHECK(write(fd, buf, cc));
+          }
         }
       }
     }
@@ -147,8 +195,11 @@ run_server()
 void
 run_client()
 {
-  printf("conn\tsend\treply\ttotal\n");
-  for (;;) {
+  // printf("conn\tsend\treply\ttotal\n");
+  char* buf = malloc(g_options.msg_size);
+  memset(buf, 1, g_options.msg_size);
+
+  for (int i=0; i<g_options.samples; ++i) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     PCHECK(fd);
 
@@ -163,21 +214,39 @@ run_client()
     start_us = now_in_usecs();
     PCHECK(connect(fd, (struct sockaddr*)&addr_in, sizeof(addr_in)));
     connect_us = now_in_usecs();
-    char c = 'a';
-    CHECK(write(fd, &c, 1) == 1);
+
+    PCHECK(write(fd, &g_options.msg_size, sizeof(g_options.msg_size)));
+    CHECK(write(fd, buf, g_options.msg_size) == g_options.msg_size);
     sent_us = now_in_usecs();
-    CHECK(read(fd, &c, 1) == 1);
+    CHECK(read(fd, buf, g_options.msg_size) == g_options.msg_size);
     reply_us = now_in_usecs();
     close(fd);
-
-    printf("%ld\t%ld\t%ld\t%ld\n",
+/*    printf("%ld\t%ld\t%ld\t%ld\n",
            connect_us - start_us,
            sent_us - connect_us,
            reply_us - sent_us,
            reply_us - start_us);
+*/
+    (void) start_us;
+    (void) connect_us;
 
-    usleep(1000000);
+    g_stats.rtt[i] = reply_us - sent_us;
+    usleep(g_options.interval_us);
   }
+
+  qsort(g_stats.rtt, g_options.samples, sizeof(g_stats.rtt[0]),
+        int64_compare);
+
+  int p50_index = g_options.samples*0.5;
+  int p95_index = g_options.samples*0.95;
+  int p99_index = g_options.samples*0.99;
+  printf("min\t50%%\t95%%\t99%%\tmax\n");
+  printf("%ld\t%ld\t%ld\t%ld\t%ld\n",
+         g_stats.rtt[0],
+         g_stats.rtt[p50_index],
+         g_stats.rtt[p95_index],
+         g_stats.rtt[p99_index],
+         g_stats.rtt[g_options.samples-1]);
 }
 
 int
@@ -191,6 +260,8 @@ main(int argc, char* argv[])
   if (g_options.mode == 0) {
     run_server();
   } else if (g_options.mode == 1) {
+    g_stats.rtt_size = g_options.samples;
+    g_stats.rtt = calloc(sizeof(int64_t), g_stats.rtt_size);
     run_client();
   } else { abort(); }
 }
